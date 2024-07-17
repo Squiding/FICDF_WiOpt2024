@@ -1,10 +1,5 @@
-# FFcil
+# FICDF
 # author Shengli Ding, assisted by ChatGPT 4o
-# FINAL VERSION
-# Version 9: Adding Fisher info matrix
-# trainning data selection based on k-mean
-# FCIL w/ memory, w/ real data sharing (w/ noise) K-mean
-# Issue:
 
 import torch
 import torch.nn as nn
@@ -17,53 +12,63 @@ import random
 import copy
 import flwr as fl
 import numpy as np
-import pickle
 import time
 from datetime import datetime
 from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
-from collections import defaultdict
 import pandas as pd
 from sklearn.cluster import KMeans
-
 from ResNet import resnet18_cbam
 
 
-my_code_version = 4
 
-if my_code_version == 1:
+#---------------------------------------------- Parameter Selections ---------------------------------------------------
+setting = 2  # Setting in Table III
+max_samples_per_centroid = 1  # Coefficient a in formular (6)
+cuda_usage = 'cuda:0'
+
+# Initialize datasets
+path_iot_dataset_root = 'YOUR PATH TO/processedData_IoTSentinel'
+path_annotation_train = 'YOUR PATH TO/train_annotations_IoTSentinel.csv'
+path_annotation_val   = 'YOUR PATH TO/val_annotations_IoTSentinel.csv'
+path_annotation_test  = 'YOUR PATH TO/test_annotations_IoTSentinel.csv'
+log_dir               = 'YOUR PATH TO/log'  # You might need to creat your own folder to store running log (e.g.
+                                            # named 'log')
+
+num_prototypes_per_class = 40
+learning_rate = 0.01
+num_global_rounds = 30
+local_epochs_per_round = 5  #  Number of local epochs per client per round
+local_epochs_first_round = 10
+seed_for_cuda = 2024  # Different from myseed, which is for IoT selection, in line 49
+
+#--------------------------------------------- Parameter Selections END-------------------------------------------------
+
+
+if setting == 1:
     tasks = [5, 10, 15, 20, 25, 30]
     clientnumber = 3
     myseed = 2024
-    version = 'v1.9.1.2_3c6t2024'
-elif my_code_version == 2:
+    version = 'FICDF_version1_v2.6_1time'
+elif setting == 2:
     tasks = [5, 10, 15, 20, 25, 30]
     clientnumber = 3
     myseed = 3024
-    version = 'v2.9.1.2_3c6t3024'
-elif my_code_version == 3:
+    version = 'FICDF_version2_v2.6_1time'
+elif setting == 3:
     tasks = [7, 14, 21, 28]
     clientnumber = 3
     myseed = 2024
-    version = 'v3.9.1.2_3c4t2024'
-elif my_code_version == 4:
+    version = 'FICDF_version3_v2.6_1time'
+elif setting == 4:
     tasks = [5, 10, 15, 20, 25, 30]
     clientnumber = 4
     myseed = 2024
-    version = 'v4.9.1.2_4c6t2024'
-
-
-num_prototypes_per_class = 40
-print('num_prototypes_per_class: ', num_prototypes_per_class)
-learning_rate = 0.01  # 0.01
-num_global_rounds = 100 # 100
-local_epochs_per_round = 5  # 5  Number of local epochs per client per round
-local_epochs_first_round = 10  # 5
-
+    version = 'FICDF_version4_v2.6_1time'
 
 current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-def log_test_accuracy(global_round, test_accuracy, current_time=current_time, log_dir="/home/ding393/projects/WiOpt2024/FFcil/final_output/log", version=version):
+def log_test_accuracy(global_round, test_accuracy, F1, current_time=current_time, log_dir=log_dir, version=version):
     # Get the current time in the specified format
-    log_file_name = f"final_FFcil_{version}_{current_time}.txt"
+    log_file_name = f"{version}_{current_time}.txt"
     log_file_path = os.path.join(log_dir, log_file_name)
 
     # Create the log directory if it doesn't exist
@@ -72,10 +77,10 @@ def log_test_accuracy(global_round, test_accuracy, current_time=current_time, lo
     # Check if the file exists, if not, create it
     if not os.path.exists(log_file_path):
         with open(log_file_path, "w") as log_file:
-            log_file.write(f"Test Accuracy after round {global_round + 1}: {test_accuracy:.2f}%\n")
+            log_file.write(f"Test Accuracy after round {global_round + 1}: {test_accuracy:.2f}% , F1: {F1:.2f}%\n")
     else:
         with open(log_file_path, "a") as log_file:
-            log_file.write(f"Test Accuracy after round {global_round + 1}: {test_accuracy:.2f}%\n")
+            log_file.write(f"Test Accuracy after round {global_round + 1}: {test_accuracy:.2f}% , F1: {F1:.2f}%\n")
 
 def setup_seed(seed):
     torch.manual_seed(seed)
@@ -84,17 +89,16 @@ def setup_seed(seed):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
 
-setup_seed(2024)
+setup_seed(seed_for_cuda)
 np.random.seed(myseed)  # for class splitting
 
 # Get the current date and time
 now = datetime.now()
 current_time = now.strftime("%Y-%m-%d %H:%M:%S")  # Format the date and time
-print("Task ran on v3: ", current_time)
+print("FICDF: ", current_time)
 
 # Start the timer
 start_time = time.time()
-
 
 class IoTDeviceDataset(Dataset):
     def __init__(self, annotation, root_dir, selected_classes, data_type='', transform=None, transform_noise=None):
@@ -174,7 +178,8 @@ class IoTDeviceDataset(Dataset):
                     print(f"Sharing Noised IoT: {label} {count}")
 
 
-def select_annotation_prototypes(dataset, client_model, device, current_classes, num_prototypes_per_class=40, max_samples_per_centroid=2):
+def select_annotation_prototypes(dataset, client_model, device, current_classes, num_prototypes_per_class=40,
+                                 max_samples_per_centroid=max_samples_per_centroid):
     """
     Select prototype data for each class using the KNN multi-centroid exemplar algorithm.
 
@@ -346,15 +351,18 @@ def evaluate_confusion_matrix(model, data_loader, device):
     # Calculate average class accuracy
     avg_class_accuracy = np.mean(class_accuracies)
 
+    # Assuming all_labels and all_predictions are defined and num_classes is set
     # Calculate precision, recall, and F1 score
     precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_predictions,
-                                                               labels=np.arange(num_classes), average='macro')
+                                                               labels=np.arange(num_classes), average='macro',
+                                                               zero_division=0)
+
     print(f'Overall Accuracy: {avg_class_accuracy:.2f}%')
     print(f'Precision: {precision*100:.2f}%')
     print(f'Recall: {recall*100:.2f}%')
     print(f'F1 Score: {f1*100:.2f}%')
 
-    return avg_class_accuracy
+    return avg_class_accuracy, f1*100
 
 
 class AddGaussianNoise(object):
@@ -386,7 +394,7 @@ test_transform = transforms.Compose([
 ])
 
 # Device selection
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+device = torch.device(cuda_usage if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 # Server definition for federated learning
@@ -413,7 +421,7 @@ class FLServer(fl.server.Server):
             # Aggregate updated local models to form the new global model
             self.aggregate_models(updated_local_models)
             # Evaluate the global model on validation data after each round
-            test_accuracy = evaluate_confusion_matrix(self.global_model, self.test_loader, self.device)
+            test_accuracy, F1_score_in100 = evaluate_confusion_matrix(self.global_model, self.test_loader, self.device)
             # print(f"Validation Accuracy after aggregation: {val_accuracy:.2f}%")
             print(f"Test Accuracy after round {num_global_rounds + 1}: {test_accuracy:.2f}%")
 
@@ -421,8 +429,8 @@ class FLServer(fl.server.Server):
             print(difference, 'count: ', count)
 
             if not exemplar_fl:
-                log_test_accuracy(global_round, test_accuracy)
-            if  difference <= 0.9:
+                log_test_accuracy(global_round, test_accuracy, F1_score_in100)
+            if  difference <= 0.5:
                 count+=1
             else:
                 count = 0
@@ -432,95 +440,11 @@ class FLServer(fl.server.Server):
             # Select the exemplars for each class
             if global_round == 0 and exemplar_fl == True:
                 for client in clients:
-                    client.prototypes_annotation_current, client.prototype_df_traindata_current =  select_annotation_prototypes(dataset=client.train_dataset,
-                                                            client_model=client.model, device=self.device,
-                                                            current_classes=client.current_classes,
-                                                            num_prototypes_per_class=num_prototypes_per_class)
-            if count == 5 and test_accuracy > 80:
-                print('break')
-                break
-
-    # def aggregate_models(self, the_clients, alpha=0.5):
-    #     client_models = []
-    #     for current_client in the_clients:
-    #         client_models.append(current_client.model)
-    #
-    #     # Deep copy the state dict of the first client model to initialize the global state dict
-    #     global_state_dict = copy.deepcopy(client_models[0].state_dict())
-    #     fisher_information_list = []
-    #
-    #     for current_client in the_clients:
-    #         fisher_information = current_client.compute_fisher_information()
-    #         fisher_information_list.append(fisher_information)
-    #
-    #     # Initialize aggregated parameters
-    #     for key in global_state_dict.keys():
-    #         global_state_dict[key] = torch.zeros_like(global_state_dict[key], dtype=torch.float32)
-    #
-    #     # Iterate over each parameter in the state dict
-    #     for key in global_state_dict.keys():
-    #         # Sum the parameters from all client models with Fisher information adjustment
-    #         for i in range(len(client_models)):
-    #             local_param = client_models[i].state_dict()[key].float()
-    #             fisher = fisher_information_list[i][key] if key in fisher_information_list[i] else torch.ones_like(
-    #                 local_param)
-    #             weight = (1 - alpha) + alpha * fisher / fisher.max()
-    #             global_state_dict[key] += weight * local_param
-    #
-    #         # Divide by the number of models to get the average
-    #         global_state_dict[key] = torch.div(global_state_dict[key], len(client_models))
-    #
-    #     # Load the averaged parameters into the global model
-    #     self.global_model.load_state_dict(global_state_dict, strict=False)
-    #
-    #     # Manually aggregate BatchNorm running mean and var
-    #     for key in self.global_model.state_dict().keys():
-    #         if 'running_mean' in key or 'running_var' in key:
-    #             global_state_dict[key] = torch.zeros_like(self.global_model.state_dict()[key], dtype=torch.float32)
-    #             for i in range(len(client_models)):
-    #                 if key in client_models[i].state_dict():
-    #                     global_state_dict[key] += client_models[i].state_dict()[key].float()
-    #             global_state_dict[key] = torch.div(global_state_dict[key], len(client_models))
-    #             self.global_model.state_dict()[key].copy_(global_state_dict[key])
-
-    # def aggregate_models(self, all_clients, alpha=0.2):
-    #     aggregated_params = {}
-    #     num_clients = len(all_clients)
-    #     fisher_information_list = []
-    #
-    #     for current_client in all_clients:
-    #         fisher_information = current_client.compute_fisher_information()
-    #         fisher_information_list.append(fisher_information)
-    #
-    #     # Initialize aggregated parameters
-    #     for name, param in self.global_model.named_parameters():
-    #         aggregated_params[name] = torch.zeros_like(param.data)
-    #
-    #     # Aggregating parameters
-    #     for name, param in self.global_model.named_parameters():
-    #         for client_idx, local_client in enumerate(all_clients):
-    #             local_param = local_client.model.state_dict()[name]
-    #             fisher = fisher_information_list[client_idx][name]
-    #
-    #             # Adjust aggregation weight based on Fisher Information
-    #             weight = (1 - alpha) + alpha * fisher / fisher.max()
-    #             aggregated_params[name] += weight * local_param
-    #
-    #         aggregated_params[name] /= num_clients
-    #
-    #     # Load aggregated parameters into global model
-    #     # Set strict=False to ignore missing keys
-    #     self.global_model.load_state_dict(aggregated_params, strict=False)
-    #
-    #     # Aggregating BatchNorm parameters manually
-    #     for name, param in self.global_model.named_buffers():
-    #         if 'running_mean' in name or 'running_var' in name:
-    #             aggregated_params[name] = torch.zeros_like(param)
-    #             for client_idx, local_client in enumerate(all_clients):
-    #                 local_param = local_client.model.state_dict()[name]
-    #                 aggregated_params[name] += local_param
-    #             aggregated_params[name] /= num_clients
-    #             self.global_model.state_dict()[name].copy_(aggregated_params[name])
+                    (client.prototypes_annotation_current,
+                     client.prototype_df_traindata_current) = select_annotation_prototypes(dataset=client.train_dataset,
+                                                              client_model=client.model, device=self.device,
+                                                              current_classes=client.current_classes,
+                                                              num_prototypes_per_class=num_prototypes_per_class)
 
     # FedAvg
     def aggregate_models(self, client_models):
@@ -634,26 +558,26 @@ class FLClient:
                 outputs = self.model(inputs)
                 loss = criterion(outputs, labels)
 
-                # Knowledge Distillation
-                for replay_inputs, replay_labels in exemplars_loader:
-                    replay_inputs = replay_inputs.to(self.device)
-                    replay_labels = replay_labels.to(self.device)
-
-                    replay_outputs = self.model(replay_inputs)
-                    with torch.no_grad():
-                        old_outputs = self.old_model(replay_inputs)
-
-                    # Set the temperature for distillation
-                    temperature = 2.0
-
-                    # Compute the distillation loss
-                    distillation_loss = nn.KLDivLoss(reduction='batchmean')(
-                        nn.functional.log_softmax(replay_outputs / temperature, dim=1),
-                        nn.functional.softmax(old_outputs / temperature, dim=1)
-                    )
-
-                    # Add the distillation loss to the total loss
-                    loss += distillation_loss
+                # # Knowledge Distillation
+                # for replay_inputs, replay_labels in exemplars_loader:
+                #     replay_inputs = replay_inputs.to(self.device)
+                #     replay_labels = replay_labels.to(self.device)
+                #
+                #     replay_outputs = self.model(replay_inputs)
+                #     with torch.no_grad():
+                #         old_outputs = self.old_model(replay_inputs)
+                #
+                #     # Set the temperature for distillation
+                #     temperature = 2.0
+                #
+                #     # Compute the distillation loss
+                #     distillation_loss = nn.KLDivLoss(reduction='batchmean')(
+                #         nn.functional.log_softmax(replay_outputs / temperature, dim=1),
+                #         nn.functional.softmax(old_outputs / temperature, dim=1)
+                #     )
+                #
+                #     # Add the distillation loss to the total loss
+                #     loss += distillation_loss
 
                 loss.backward()
                 optimizer.step()
@@ -666,27 +590,11 @@ class FLClient:
             training_accuracy = 100 * correct / total
             val_accuracy = evaluate(self.model, val_loader, self.device)
             print(
-                f"Client {self.client_id + 1} Epoch [{epoch + 1}/{self.local_epochs_per_round}], Loss: {running_loss / len(train_loader):.4f}, Training Accuracy: {training_accuracy:.2f}%, Validation Accuracy: {val_accuracy:.2f}%")
-
-            # # Dynamic learning rate adjustment
-            # if 0.5 < current_global_round_portion < 0.75:
-            #     new_lr = self.learning_rate / 5
-            #     optimizer = optim.SGD(self.model.parameters(), lr=new_lr, weight_decay=0.00001)
-            # elif current_global_round_portion < 0.90:
-            #     new_lr = self.learning_rate / 25
-            #     optimizer = optim.SGD(self.model.parameters(), lr=new_lr, weight_decay=0.00001)
-            # else:
-            #     new_lr = self.learning_rate / 125
-            #     optimizer = optim.SGD(self.model.parameters(), lr=new_lr, weight_decay=0.00001)
+                f"Client {self.client_id + 1} Epoch [{epoch + 1}/{self.local_epochs_per_round}], "
+                f"Loss: {running_loss / len(train_loader):.4f}, "
+                f"Training Accuracy: {training_accuracy:.2f}%, Validation Accuracy: {val_accuracy:.2f}%")
 
         return self.model
-
-
-# Initialize datasets
-path_iot_dataset_root = '/home/ding393/projects/WiOpt2024/Preprocessing/preprocessedData/processedData_IoTSentinel'
-path_annotation_train = '/home/ding393/projects/WiOpt2024/Preprocessing/preprocessedData/processedData_IoTSentinel/train_annotations_IoTSentinel.csv'
-path_annotation_val = '/home/ding393/projects/WiOpt2024/Preprocessing/preprocessedData/processedData_IoTSentinel/val_annotations_IoTSentinel.csv'
-path_annotation_test = '/home/ding393/projects/WiOpt2024/Preprocessing/preprocessedData/processedData_IoTSentinel/test_annotations_IoTSentinel.csv'
 
 annotation_train = pd.read_csv(path_annotation_train, header=None)
 annotation_val = pd.read_csv(path_annotation_val, header=None)
@@ -697,8 +605,7 @@ feature_extractor = resnet18_cbam()
 global_model = Network(tasks[0], feature_extractor)
 global_model = model_to_device(global_model, device)
 
-# clients = [FLClient(global_model, i, train_dataset, val_dataset, test_dataset) for i in range(3)]  # 3 clients
-clients = [FLClient(global_model, i, learning_rate, device=device) for i in range(clientnumber)]  # 3 clients
+clients = [FLClient(global_model, i, learning_rate, device=device) for i in range(clientnumber)]
 
 # Create and run the federated learning server
 client_manager = fl.server.client_manager.SimpleClientManager()
@@ -835,10 +742,6 @@ for task_index, num_classes in enumerate(tasks):
     fl_server.fit(num_global_rounds=1, local_epochs_per_round=local_epochs_first_round,
                   clients=active_clients, test_loader=test_loader, exemplar_fl=True)
 
-    # # Evaluate the global model on the test dataset at the end of each task
-    # test_accuracy = fl_server.evaluate_confusion_matrix(test_loader)
-    # print('')
-    # print(f"Test Accuracy after Task {task_index + 1}: {test_accuracy:.2f}%")
     print("=" * 120)
 
     # -------------------------------- update the clients' datasets with prototype sharing  ----------------------------
@@ -881,7 +784,7 @@ for task_index, num_classes in enumerate(tasks):
 
     # Evaluate the global model on the test dataset at the end of each task
     test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
-    test_accuracy = fl_server.evaluate_confusion_matrix(test_loader)
+    test_accuracy, F1_score_in100 = fl_server.evaluate_confusion_matrix(test_loader)
     print('')
     print(f"Test Accuracy after Task {task_index + 1}: {test_accuracy:.2f}%")
     print("=" * 120)
@@ -894,7 +797,7 @@ test_dataset = IoTDeviceDataset(annotation=annotation_test, root_dir=path_iot_da
                                 selected_classes=class_indices_final, transform=test_transform)
 
 test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
-test_accuracy = fl_server.evaluate_confusion_matrix(test_loader)
+test_accuracy, F1_score_in100 = fl_server.evaluate_confusion_matrix(test_loader)
 print('')
 print('')
 print(f"Final Test Accuracy after all Tasks: {test_accuracy:.2f}%")
