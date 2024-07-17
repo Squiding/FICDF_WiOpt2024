@@ -1,3 +1,8 @@
+# FICDF
+# Feature extractor
+
+# This code use the work from https://github.com/conditionWang/FCIL
+
 import torch
 import torch.nn as nn
 import math
