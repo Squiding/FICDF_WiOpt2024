@@ -1,5 +1,6 @@
 This is the code of FICDF for WiOpt 2024
 
+python version 3.10
 
 1. Use preprocessed data
 
